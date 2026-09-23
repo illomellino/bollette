@@ -43,6 +43,7 @@ FORNITORI_NOTI = [
     "Enel Energia", "Enel", "A2A", "Iren", "Hera Comm", "Hera",
     "Sorgenia", "Edison", "Eni Plenitude", "Plenitude", "Acea",
     "Engie", "Wekiwi", "Pulsee", "Illumia", "NeN", "Octopus Energy",
+    "Pavia Acque",
 ]
 
 UNITA_LUCE = "kWh"
@@ -110,7 +111,7 @@ def estrai_testo(file_bytes: bytes) -> str:
 
 
 # ============================================================
-# PARSING (best effort, da correggere a mano se necessario)
+# PARSING (best effort, con estrattori dedicati per fornitori noti)
 # ============================================================
 
 def _numero_ita_a_float(s: str) -> float | None:
@@ -128,9 +129,17 @@ def _numero_ita_a_float(s: str) -> float | None:
         return None
 
 
+def _data_ita_a_iso(d: str) -> str:
+    d = d.replace(".", "/")
+    try:
+        return datetime.strptime(d, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
 def rileva_tipo(testo: str) -> str:
     t = testo.lower()
-    if re.search(r"\bm3\b|\bm³\b|metri cubi|acquedotto|fognatura|depurazione", t):
+    if re.search(r"\bm3\b|\bm³\b|\bmc\b|metri cubi|acquedotto|fognatura|depurazione", t):
         return "acqua"
     return "luce"
 
@@ -149,33 +158,24 @@ def rileva_periodo(testo: str) -> tuple[str, str]:
     )
     if not m:
         return "", ""
-
-    def conv(d):
-        d = d.replace(".", "/")
-        try:
-            return datetime.strptime(d, "%d/%m/%Y").strftime("%Y-%m-%d")
-        except ValueError:
-            return ""
-
-    return conv(m.group(1)), conv(m.group(2))
+    return _data_ita_a_iso(m.group(1)), _data_ita_a_iso(m.group(2))
 
 
 def rileva_consumo(testo: str, tipo: str) -> float | None:
     if tipo == "luce":
         pattern = r"(\d{1,3}(?:\.\d{3})*(?:,\d+)?)\s*kwh"
     else:
-        pattern = r"(\d{1,3}(?:\.\d{3})*(?:,\d+)?)\s*(?:m3|m³|metri cubi)"
+        pattern = r"(\d{1,3}(?:\.\d{3})*(?:,\d+)?)\s*(?:m3|m³|mc|metri cubi)"
 
     candidati = re.findall(pattern, testo, re.IGNORECASE)
-    if not candidati:
-        return None
-
-    # Euristica: prendi il valore più plausibile (di solito il consumo
-    # totale del periodo è tra i più grandi tra quelli trovati, ma non
-    # esagerato tipo un codice cliente). Va sempre verificato a mano.
     valori = [_numero_ita_a_float(c) for c in candidati]
     valori = [v for v in valori if v and 0 < v < 100000]
-    return max(valori) if valori else None
+
+    # Euristica: il primo valore trovato è quasi sempre il consumo del
+    # periodo fatturato (compare nel riepilogo in testa alla bolletta),
+    # mentre valori più grandi trovati più avanti nel testo sono spesso
+    # consumi annui/cumulativi. Va comunque sempre verificato a mano.
+    return valori[0] if valori else None
 
 
 def rileva_importo(testo: str) -> float | None:
@@ -190,7 +190,7 @@ def rileva_importo(testo: str) -> float | None:
     return None
 
 
-def estrai_dati(testo: str, nome_file: str) -> dict:
+def estrai_generico(testo: str, nome_file: str) -> dict:
     tipo = rileva_tipo(testo)
     periodo_da, periodo_a = rileva_periodo(testo)
     return {
@@ -203,6 +203,106 @@ def estrai_dati(testo: str, nome_file: str) -> dict:
         "importo": rileva_importo(testo),
         "file_origine": nome_file,
     }
+
+
+def estrai_pavia_acque(testo: str, nome_file: str) -> dict:
+    """Estrattore dedicato per le bollette acqua di Pavia Acque."""
+
+    dati = estrai_generico(testo, nome_file)
+    dati["tipo"] = "acqua"
+    dati["fornitore"] = "Pavia Acque"
+    dati["unita"] = UNITA_ACQUA
+
+    # Periodo: dalla riga "Consumo del periodo dal DD/MM/YYYY al DD/MM/YYYY"
+    m_periodo = re.search(
+        r"Consumo del periodo\s+dal\s+(\d{2}/\d{2}/\d{4})\s+al\s+(\d{2}/\d{2}/\d{4})",
+        testo, re.IGNORECASE,
+    )
+    if m_periodo:
+        dati["periodo_da"] = _data_ita_a_iso(m_periodo.group(1))
+        dati["periodo_a"] = _data_ita_a_iso(m_periodo.group(2))
+
+    # Consumo netto fatturato: sul frontespizio è espresso come somma
+    # algebrica tipo "Consumo mc 32 - 5 + 1" (lettura - acconto prec. +
+    # stima gg mancanti). Sommiamo i termini per ottenere il netto.
+    m_cons = re.search(
+        r"Consumo\s+mc\s*[:\s]*([\-\+0-9\s]{2,40})(?=Totale\s+bolletta|Scadenza)",
+        testo, re.IGNORECASE,
+    )
+    if m_cons:
+        numeri = re.findall(r"[\-\+]?\s*\d+", m_cons.group(1))
+        numeri = [n.replace(" ", "") for n in numeri]
+        if numeri:
+            try:
+                dati["consumo"] = float(sum(int(n) for n in numeri))
+            except ValueError:
+                pass
+
+    # Importo totale: "Totale bolletta € 63,00" oppure "Totale Bolletta 63,00"
+    m_imp = re.search(
+        r"Totale\s+[Bb]olletta\s*€?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
+        testo,
+    )
+    if m_imp:
+        dati["importo"] = _numero_ita_a_float(m_imp.group(1))
+
+    return dati
+
+
+def estrai_engie(testo: str, nome_file: str) -> dict:
+    """Estrattore dedicato per le bollette luce di Engie."""
+
+    dati = estrai_generico(testo, nome_file)
+    dati["tipo"] = "luce"
+    dati["fornitore"] = "Engie"
+    dati["unita"] = UNITA_LUCE
+
+    # Periodo di fatturazione (non il "periodo di riferimento" annuo)
+    m_periodo = re.search(
+        r"Periodo di fatturazione:\s*dal\s+(\d{2}/\d{2}/\d{4})\s+al\s+(\d{2}/\d{2}/\d{4})",
+        testo, re.IGNORECASE,
+    )
+    if m_periodo:
+        dati["periodo_da"] = _data_ita_a_iso(m_periodo.group(1))
+        dati["periodo_a"] = _data_ita_a_iso(m_periodo.group(2))
+
+    # Consumo del periodo: preferiamo la riga "Totale kWh 1.006,739 ..."
+    # della tabella consumi fatturati (valore preciso), altrimenti il
+    # numero accanto a "CONSUMO ELETTRICO" in testa alla bolletta.
+    m_cons = re.search(r"Totale\s+kWh\s+(\d{1,3}(?:\.\d{3})*(?:,\d+)?)", testo, re.IGNORECASE)
+    if not m_cons:
+        m_cons = re.search(
+            r"CONSUMO ELETTRICO.*?(\d{1,3}(?:\.\d{3})*(?:,\d+)?)\s*kWh",
+            testo, re.IGNORECASE | re.DOTALL,
+        )
+    if m_cons:
+        dati["consumo"] = _numero_ita_a_float(m_cons.group(1))
+
+    # Importo: "TOTALE DA PAGARE ENERGIA 275,19 €", con fallback sul
+    # totale mostrato nel riepilogo di prima pagina.
+    m_imp = re.search(r"TOTALE\s+DA\s+PAGARE\s+ENERGIA\s+(\d{1,3}(?:\.\d{3})*,\d{2})", testo, re.IGNORECASE)
+    if not m_imp:
+        m_imp = re.search(r"SINTESI IMPORTI FATTURATI\D{0,20}(\d{1,3}(?:\.\d{3})*,\d{2})\s*€", testo, re.IGNORECASE)
+    if m_imp:
+        dati["importo"] = _numero_ita_a_float(m_imp.group(1))
+
+    return dati
+
+
+# Estrattori dedicati, provati in ordine prima del fallback generico.
+# Ogni voce: (stringa da cercare nel testo, funzione estrattore).
+ESTRATTORI_DEDICATI = [
+    ("pavia acque", estrai_pavia_acque),
+    ("engie", estrai_engie),
+]
+
+
+def estrai_dati(testo: str, nome_file: str) -> dict:
+    t_lower = testo.lower()
+    for chiave, funzione in ESTRATTORI_DEDICATI:
+        if chiave in t_lower:
+            return funzione(testo, nome_file)
+    return estrai_generico(testo, nome_file)
 
 
 # ============================================================
